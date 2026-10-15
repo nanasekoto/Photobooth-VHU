@@ -8,6 +8,9 @@ public static class ImageProcessor
 {
     public static BitmapSource Apply(BitmapSource source, FilterPreset preset, CubeLut? lut = null)
     {
+        if (preset == FilterPreset.Original) return source;
+        if (preset == FilterPreset.CustomLut && lut is null)
+            throw new InvalidOperationException("Chưa nạp 3D LUT.");
         var converted = new FormatConvertedBitmap(source, PixelFormats.Bgra32, null, 0);
         var width = converted.PixelWidth;
         var height = converted.PixelHeight;
@@ -15,8 +18,11 @@ public static class ImageProcessor
         var pixels = new byte[stride * height];
         converted.CopyPixels(pixels, stride, 0);
 
-        for (var i = 0; i < pixels.Length; i += 4)
+        Parallel.For(0, height, row =>
         {
+          var rowEnd = (row + 1) * stride;
+          for (var i = row * stride; i < rowEnd; i += 4)
+          {
             float b = pixels[i] / 255f;
             float g = pixels[i + 1] / 255f;
             float r = pixels[i + 2] / 255f;
@@ -32,7 +38,8 @@ public static class ImageProcessor
             pixels[i] = ToByte(b);
             pixels[i + 1] = ToByte(g);
             pixels[i + 2] = ToByte(r);
-        }
+          }
+        });
 
         var output = new WriteableBitmap(width, height, converted.DpiX, converted.DpiY, PixelFormats.Bgra32, null);
         output.WritePixels(new Int32Rect(0, 0, width, height), pixels, stride, 0);

@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+credentials*.json
+client_secret*.json
+*.tokens
+**/EDSDK.dll
+**/EdsImage.dll
+
