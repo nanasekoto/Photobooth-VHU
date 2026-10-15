@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "dgSpecHash": "Vb0C6WOatv0=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\An\\Downloads\\PhotoboothStarter (1)\\PhotoboothStarter\\Photobooth.App\\Photobooth.App.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\An\\.nuget\\packages\\opencvsharp4\\4.13.0.20260627\\opencvsharp4.4.13.0.20260627.nupkg.sha512",
+    "C:\\Users\\An\\.nuget\\packages\\opencvsharp4.runtime.win\\4.13.0.20260627\\opencvsharp4.runtime.win.4.13.0.20260627.nupkg.sha512",
+    "C:\\Users\\An\\.nuget\\packages\\opencvsharp4.wpfextensions\\4.13.0.20260627\\opencvsharp4.wpfextensions.4.13.0.20260627.nupkg.sha512"
+  ],
+  "logs": []
+}
