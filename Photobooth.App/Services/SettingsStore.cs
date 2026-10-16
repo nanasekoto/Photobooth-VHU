@@ -15,6 +15,9 @@ public static class SettingsStore
         settings.JpegQuality = Math.Clamp(settings.JpegQuality, 1, 100);
         settings.SyncTimeoutSeconds = Math.Clamp(settings.SyncTimeoutSeconds, 30, 1800);
         if (settings.VideoDeviceIndex < 0) settings.VideoDeviceIndex = 0;
+        if (!Enum.IsDefined(settings.PreviewSource)) settings.PreviewSource = LiveViewMode.VideoDevice;
+        if (!Enum.IsDefined(settings.CaptureMode)) settings.CaptureMode = CaptureMode.Simulation;
+        if (!Enum.IsDefined(settings.Layout)) settings.Layout = PhotoLayout.Grid2x2;
         return settings;
     }
 

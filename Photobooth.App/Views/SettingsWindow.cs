@@ -29,7 +29,7 @@ public sealed class SettingsWindow : Window
         {
             var button = new Button { Content = text }; button.Click += (_, _) => action(); stack.Children.Add(button); return button;
         }
-        void FileField(string title, string path, string filter, Action<string> assign)
+        void FileField(string title, string path, string filter, Action<string> assign, double? frameRatio = null)
         {
             Label(title); var box = Field(path); box.IsReadOnly = true;
             Button("Chọn file", () =>
@@ -38,14 +38,17 @@ public sealed class SettingsWindow : Window
                 if (picker.ShowDialog(this) != true) return;
                 try
                 {
-                    if (filter.StartsWith("PNG")) _ = BitmapTools.Load(picker.FileName);
+                    if (frameRatio is { } ratio) _ = BitmapTools.LoadFrame(picker.FileName, ratio, title);
                     assign(picker.FileName); box.Text = picker.FileName;
                 }
                 catch (Exception ex) { MessageBox.Show(this, ex.Message, "Không đọc được file"); }
             });
         }
-        Label("Chế độ chụp");
-        var mode = new ComboBox { ItemsSource = new[] { "Giả lập 6000×4000 (không phải máy thật)", "Canon R8 • USB tether + HDMI capture card" }, SelectedIndex = (int)Settings.CaptureMode };
+        Label("Nguồn Live View (độc lập với nguồn chụp)");
+        var preview = new ComboBox { ItemsSource = new[] { "Video thật • Webcam / HDMI Capture Card", "Hình minh họa giả lập • Không có người thật" }, SelectedIndex = (int)Settings.PreviewSource };
+        stack.Children.Add(preview);
+        Label("Nguồn ảnh chụp");
+        var mode = new ComboBox { ItemsSource = new[] { "Giả lập 6000×4000 từ preview (có nhãn, không phải Canon)", "Canon R8 • JPEG qua USB tether", "Ảnh từ frame webcam/capture card (không phải Canon)" }, SelectedIndex = (int)Settings.CaptureMode };
         stack.Children.Add(mode);
         Label("Thiết bị HDMI capture card (DirectShow)");
         var video = new ComboBox(); stack.Children.Add(video);
@@ -57,9 +60,9 @@ public sealed class SettingsWindow : Window
         Label("Thư mục xuất trong Google Drive for desktop");
         var output = Field(Settings.OutputDirectory);
         Button("Chọn thư mục lưu", () => { var dialog = new OpenFolderDialog(); if (dialog.ShowDialog(this) == true) output.Text = dialog.FolderName; });
-        FileField("Frame ảnh đơn • 3:2", Settings.SingleFramePath, "PNG|*.png", path => Settings.SingleFramePath = path);
-        FileField("Frame lưới 2×2 • 3:2", Settings.GridFramePath, "PNG|*.png", path => Settings.GridFramePath = path);
-        FileField("Frame dải dọc 1×4 • 3:8", Settings.StripFramePath, "PNG|*.png", path => Settings.StripFramePath = path);
+        FileField("Frame ảnh đơn • 3:2", Settings.SingleFramePath, "PNG|*.png", path => Settings.SingleFramePath = path, 1.5);
+        FileField("Frame lưới 2×2 • 3:2", Settings.GridFramePath, "PNG|*.png", path => Settings.GridFramePath = path, 1.5);
+        FileField("Frame dải dọc 1×4 • 3:8", Settings.StripFramePath, "PNG|*.png", path => Settings.StripFramePath = path, 0.375);
         Label("JPEG Quality (1–100; tách biệt với kích thước ảnh cố định 70%)");
         var quality = Field(Settings.JpegQuality.ToString());
         Label("Folder ID thư mục cha trên Google Drive (cùng thư mục với đường dẫn lưu)");
@@ -89,6 +92,12 @@ public sealed class SettingsWindow : Window
                 if (!Path.IsPathFullyQualified(output.Text.Trim())) throw new InvalidDataException("Cần đường dẫn lưu tuyệt đối.");
                 Settings.OutputDirectory = output.Text.Trim(); Settings.VideoDeviceIndex = device;
                 Settings.CaptureMode = (CaptureMode)mode.SelectedIndex; Settings.DriveParentId = parent.Text.Trim();
+                Settings.PreviewSource = (LiveViewMode)preview.SelectedIndex;
+                if (Settings.CaptureMode == CaptureMode.VideoFrame && Settings.PreviewSource != LiveViewMode.VideoDevice)
+                    throw new InvalidDataException("Chụp frame video cần chọn nguồn Live View thật.");
+                _ = BitmapTools.LoadFrame(Settings.SingleFramePath, 1.5, "Frame ảnh đơn");
+                _ = BitmapTools.LoadFrame(Settings.GridFramePath, 1.5, "Frame lưới");
+                _ = BitmapTools.LoadFrame(Settings.StripFramePath, 0.375, "Frame dải dọc");
                 Settings.JpegQuality = q; Settings.SyncTimeoutSeconds = t;
                 SettingsStore.Save(Settings); DialogResult = true;
             }

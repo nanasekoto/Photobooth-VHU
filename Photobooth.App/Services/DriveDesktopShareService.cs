@@ -17,10 +17,10 @@ public sealed class DriveDesktopShareService : IDisposable
     private string _credentialsPath = "";
     private sealed record LocalFile(string Name, long Size, string Md5);
 
-    public async Task<string> WaitAndShareAsync(string directory, SessionSnapshot session, IProgress<string> progress, CancellationToken token)
+    public async Task<string> WaitAndShareAsync(string directory, DriveShareOptions options, IProgress<string> progress, CancellationToken token)
     {
-        if (string.IsNullOrWhiteSpace(session.DriveParentId)) throw new InvalidOperationException("Chưa cấu hình Folder ID thư mục cha trên Drive.");
-        _credentialsPath = session.GoogleCredentialsPath;
+        if (string.IsNullOrWhiteSpace(options.ParentId)) throw new InvalidOperationException("Chưa cấu hình Folder ID thư mục cha trên Drive. Bấm Sửa Drive / Đăng nhập.");
+        _credentialsPath = options.CredentialsPath;
         var expected = new List<LocalFile>();
         foreach (var name in new[] { "photo_01.jpg", "photo_02.jpg", "photo_03.jpg", "photo_04.jpg", "photobooth_vhu.jpg" })
         {
@@ -29,7 +29,7 @@ public sealed class DriveDesktopShareService : IDisposable
             expected.Add(new LocalFile(name, file.Length, Convert.ToHexString(await MD5.HashDataAsync(file, token)).ToLowerInvariant()));
         }
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
-        deadline.CancelAfter(TimeSpan.FromSeconds(session.SyncTimeoutSeconds));
+        deadline.CancelAfter(TimeSpan.FromSeconds(options.TimeoutSeconds));
         try
         {
             string? folderId = null;
@@ -39,7 +39,7 @@ public sealed class DriveDesktopShareService : IDisposable
                 try
                 {
                     progress.Report("Đang chờ Drive for desktop đồng bộ thư mục...");
-                    var folders = await ListFilesAsync($"'{Escape(session.DriveParentId)}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '{Escape(Path.GetFileName(directory))}'", deadline.Token);
+                    var folders = await ListFilesAsync($"'{Escape(options.ParentId)}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '{Escape(Path.GetFileName(directory))}'", deadline.Token);
                     if (folders.Count > 1) throw new InvalidOperationException("Có nhiều thư mục phiên trùng tên trên Drive. Không thể tự chọn để chia sẻ an toàn.");
                     if (folders.Count == 1)
                     {

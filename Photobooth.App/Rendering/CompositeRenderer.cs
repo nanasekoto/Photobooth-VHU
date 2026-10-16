@@ -25,10 +25,8 @@ public static class CompositeRenderer
         {
             token.ThrowIfCancellationRequested();
             var source = BitmapTools.Load(sources[i]);
-            if (source.PixelWidth != 6000 || source.PixelHeight != 4000)
-                throw new InvalidDataException("Ảnh nhận phải là JPEG ngang 6000×4000. Kiểm tra Large JPEG và tắt xoay tự động trên Canon.");
             // Downsample before the CPU colour pass. Each photo receives the colour transform exactly once.
-            result[i] = ImageProcessor.Apply(BitmapTools.Resize(source, SingleWidth, SingleHeight), session.Filter, session.Lut);
+            result[i] = ImageProcessor.Apply(BitmapTools.NormalizeLandscape(source, SingleWidth, SingleHeight), session.Filter, session.Lut);
         }
         return result;
     }
@@ -37,6 +35,7 @@ public static class CompositeRenderer
         IReadOnlyList<StickerPlacement> stickers, bool preview = false)
     {
         if (photos.Count != PhotoCount) throw new InvalidOperationException("Cần đủ 4 ảnh để ghép.");
+        BitmapTools.ValidateFrame(session.LayoutFrame, session.Layout == PhotoLayout.Grid2x2 ? 1.5 : 0.375, "Frame bố cục");
         var (width, height) = OutputSize(session.Layout);
         if (preview) { height = (int)Math.Round(height * (1200d / width)); width = 1200; }
         return BitmapTools.Render(width, height, dc =>
@@ -58,6 +57,7 @@ public static class CompositeRenderer
         IReadOnlyList<StickerPlacement> stickers, string directory, CancellationToken token)
     {
         Directory.CreateDirectory(directory);
+        BitmapTools.ValidateFrame(session.SingleFrame, 1.5, "Frame ảnh đơn");
         for (var i = 0; i < PhotoCount; i++)
         {
             token.ThrowIfCancellationRequested();

@@ -85,7 +85,7 @@ public sealed class SimulatedLiveViewSource : ILiveViewSource
     public ValueTask DisposeAsync() { LatestFrame = null; return ValueTask.CompletedTask; }
 }
 
-public sealed class SimulatedCaptureController : IPhotoCaptureController
+public sealed class SimulatedCaptureController(Func<BitmapSource?>? videoFrame = null) : IPhotoCaptureController
 {
     private int _shot;
     public Task ConnectAsync(CancellationToken token) { token.ThrowIfCancellationRequested(); return Task.CompletedTask; }
@@ -93,7 +93,15 @@ public sealed class SimulatedCaptureController : IPhotoCaptureController
     public Task CaptureToFileAsync(string path, CancellationToken token) => BitmapTools.OnStaAsync(() =>
     {
         token.ThrowIfCancellationRequested();
-        var image = CreateDemo(6000, 4000, $"ẢNH GIẢ LẬP {Interlocked.Increment(ref _shot)} • KHÔNG PHẢI ẢNH CANON");
+        var title = $"GIẢ LẬP {Interlocked.Increment(ref _shot)} • KHÔNG PHẢI ẢNH CANON";
+        var frame = videoFrame?.Invoke();
+        var image = frame is null ? CreateDemo(6000, 4000, title) : BitmapTools.Render(6000, 4000, dc =>
+        {
+            dc.DrawImage(BitmapTools.NormalizeLandscape(frame, 6000, 4000), new Rect(0, 0, 6000, 4000));
+            dc.DrawRectangle(Brushes.DodgerBlue, null, new Rect(0, 3800, 6000, 200));
+            dc.DrawText(new FormattedText(title, CultureInfo.GetCultureInfo("vi-VN"), FlowDirection.LeftToRight,
+                new Typeface("Segoe UI Semibold"), 100, Brushes.White, 1), new System.Windows.Point(100, 3830));
+        });
         Services.ImageExporter.SaveJpeg(image, path, 95);
         return true;
     }, token);
@@ -107,4 +115,16 @@ public sealed class SimulatedCaptureController : IPhotoCaptureController
             new Typeface("Segoe UI Semibold"), width / 30d, Brushes.White, 1);
         dc.DrawText(label, new System.Windows.Point((width - label.Width) / 2, height / 2d));
     });
+}
+
+public sealed class VideoFrameCaptureController(Func<BitmapSource?> videoFrame) : IPhotoCaptureController
+{
+    public Task ConnectAsync(CancellationToken token) { token.ThrowIfCancellationRequested(); return Task.CompletedTask; }
+    public Task AutoFocusAsync(CancellationToken token) => Task.CompletedTask;
+    public Task CaptureToFileAsync(string path, CancellationToken token)
+    {
+        var frame = videoFrame() ?? throw new IOException("Không có frame video để chụp.");
+        return BitmapTools.OnStaAsync(() => { token.ThrowIfCancellationRequested(); Services.ImageExporter.SaveJpeg(frame, path, 95); return true; }, token);
+    }
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }

@@ -39,6 +39,35 @@ public static class BitmapTools
     public static BitmapSource Resize(BitmapSource image, int width, int height) =>
         Render(width, height, dc => dc.DrawImage(image, new Rect(0, 0, width, height)));
 
+    public static BitmapSource NormalizeLandscape(BitmapSource image, int width, int height)
+    {
+        if (width * 2 != height * 3) throw new ArgumentException("Canvas ảnh đơn phải có tỷ lệ 3:2.");
+        // Crop whole 3x2 pixel blocks to keep exactly equal X/Y scaling, including 16:9 webcam sources.
+        var block = Math.Min(image.PixelWidth / 3, image.PixelHeight / 2);
+        if (block < 1) throw new InvalidDataException("Ảnh nguồn quá nhỏ.");
+        var cropWidth = block * 3;
+        var cropHeight = block * 2;
+        var cropped = new CroppedBitmap(image, new Int32Rect((image.PixelWidth - cropWidth) / 2,
+            (image.PixelHeight - cropHeight) / 2, cropWidth, cropHeight));
+        cropped.Freeze();
+        return Resize(cropped, width, height);
+    }
+
+    public static BitmapSource LoadFrame(string path, double expectedRatio, string label)
+    {
+        var image = Load(path);
+        ValidateFrame(image, expectedRatio, label);
+        return image;
+    }
+
+    public static void ValidateFrame(BitmapSource image, double expectedRatio, string label)
+    {
+        var actual = image.PixelWidth / (double)image.PixelHeight;
+        if (Math.Abs(actual / expectedRatio - 1) > 0.01)
+            throw new InvalidDataException($"{label}: PNG {image.PixelWidth}×{image.PixelHeight} sai tỷ lệ. Cần " +
+                (Math.Abs(expectedRatio - 1.5) < 0.01 ? "khung ngang 3:2." : "khung dải dọc 3:8 (1 cột × 4 hàng)."));
+    }
+
     // Each render job owns its WPF objects; only frozen bitmaps cross thread boundaries.
     public static Task<T> OnStaAsync<T>(Func<T> action, CancellationToken token = default)
     {
