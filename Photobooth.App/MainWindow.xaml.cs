@@ -1,346 +1,263 @@
-using System;
-using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Input;
-using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using Photobooth.App.Camera;
 using Photobooth.App.Imaging;
+using Photobooth.App.Models;
+using Photobooth.App.Rendering;
 using Photobooth.App.Services;
+using Photobooth.App.Views;
 
 namespace Photobooth.App;
 
 public partial class MainWindow : Window
 {
-    private readonly ICameraController _camera = new WebcamCameraController();
-    private readonly List<BitmapSource> _capturedShots = new();
-    private readonly DispatcherTimer _liveViewTimer = new();
-
-    private BitmapSource? _rawPreview;
-    private CubeLut? _activeLut;
-    private bool _isBusy;
-    private string _outputDirectory = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "MiraiPhotobooth");
+    private BoothSettings _settings = new();
+    private BoothState _state;
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly StaRenderWorker _previewWorker = new("VHU continuous live preview");
+    private readonly DispatcherTimer _previewTimer = new() { Interval = TimeSpan.FromMilliseconds(33) };
+    private CancellationTokenSource? _captureCancellation;
+    private ILiveViewSource? _liveView;
+    private IPhotoCaptureController? _capture;
+    private CubeLut? _lut;
+    private SessionSnapshot? _session;
+    private ReviewWindow? _review;
+    private BitmapSource? _lastPreviewSource;
+    private bool _previewBusy;
+    private int _previewGeneration;
+    private bool _connected;
+    private bool _connecting;
+    private bool _initialized;
+    private bool _closing;
+    private bool _closeAllowed;
+    private Task _operation = Task.CompletedTask;
 
     public MainWindow()
     {
         InitializeComponent();
-        OutputFolderText.Text = _outputDirectory;
-
-        _liveViewTimer.Interval = TimeSpan.FromMilliseconds(33); // ~30 FPS
-        _liveViewTimer.Tick += async (s, e) =>
-        {
-            if (!_isBusy && _camera.IsConnected)
-            {
-                _rawPreview = await _camera.GetLiveViewAsync();
-                RefreshPreview();
-            }
-        };
+        var version = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "0.2.0";
+        var architecture = Environment.Is64BitProcess ? "x64" : "x86";
+        Title = $"Photobooth VHU v{version} • .NET 8 • {architecture}";
+        _previewTimer.Tick += Preview_Tick;
     }
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
     {
-        SetStatus("Sẵn sàng. Hãy bấm 'Bật Webcam' để xem trực tiếp.");
-    }
-
-    private async void ConnectCamera_Click(object sender, RoutedEventArgs e)
-    {
         try
         {
-            SetStatus("Đang mở webcam...");
-            await _camera.ConnectAsync();
-            ConnectionStatus.Text = "WEBCAM ĐANG CHẠY";
-            ConnectionDot.Fill = Brushes.LightGreen;
-            ConnectButton.Content = "Đã kết nối";
-            ConnectButton.IsEnabled = false;
-            SetStatus("Kết nối webcam thành công.");
-
-            _liveViewTimer.Start();
+            _settings = SettingsStore.Load(); DefaultAssets.EnsureCreated(_settings);
+            LayoutCombo.ItemsSource = new[] { "Lưới 2×2", "Dải dọc — 1 cột × 4 hàng" };
+            FilterCombo.ItemsSource = Enum.GetValues<FilterPreset>();
+            LayoutCombo.SelectedIndex = (int)_settings.Layout; FilterCombo.SelectedItem = _settings.Filter;
+            if (!string.IsNullOrWhiteSpace(_settings.LutPath))
+            {
+                try { _lut = CubeLut.Load(_settings.LutPath); LutLabel.Text = Path.GetFileName(_settings.LutPath); }
+                catch (Exception ex) { _settings.Filter = FilterPreset.Original; FilterCombo.SelectedItem = _settings.Filter; StatusLabel.Text = ex.Message; }
+            }
+            LoadLiveFrame(); SettingsStore.Save(_settings);
+            _initialized = true; UpdateModeLabel(); SetState(BoothState.Ready);
         }
-        catch (Exception ex)
+        catch (Exception ex) { ShowError(ex); }
+    }
+
+    private void UpdateModeLabel()
+    {
+        var preview = _settings.PreviewSource == LiveViewMode.VideoDevice ? "Live View thật: Webcam / Capture Card" : "Live View minh họa tĩnh";
+        var capture = _settings.CaptureMode switch
         {
-            SetStatus($"Lỗi kết nối webcam: {ex.Message}");
-            MessageBox.Show(this, ex.Message, "Lỗi kết nối", MessageBoxButton.OK, MessageBoxImage.Error);
-        }
+            CaptureMode.Canon => "Chụp JPEG Canon qua USB tether",
+            CaptureMode.VideoFrame => "Chụp frame video • Không phải ảnh Canon",
+            _ => "Chụp giả lập 6000×4000 từ preview • Có nhãn, không phải Canon"
+        };
+        ModeLabel.Text = preview + "\n\n" + capture;
     }
 
-    private void FilterComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void Connect_Click(object sender, RoutedEventArgs e)
     {
-        if (_rawPreview is not null) RefreshPreview();
+        if (_connecting || _state != BoothState.Ready || _closing) return;
+        _operation = ConnectAsync(); await _operation;
     }
-
-    private void RefreshPreview()
+    private async Task ConnectAsync()
     {
-        if (_rawPreview is null) return;
+        _connecting = true; SetState(BoothState.Ready);
         try
         {
-            var preset = GetSelectedPreset();
-            if (preset == FilterPreset.CustomLut && _activeLut is null)
+            await DisconnectAsync();
+            _liveView = _settings.PreviewSource == LiveViewMode.VideoDevice
+                ? new HdmiLiveViewSource(_settings.VideoDeviceIndex, _settings.VideoWidth, _settings.VideoHeight)
+                : new SimulatedLiveViewSource();
+            await _liveView.ConnectAsync(_lifetime.Token);
+            _capture = _settings.CaptureMode switch
             {
-                PreviewImage.Source = _rawPreview;
-                return;
-            }
-            PreviewImage.Source = ImageProcessor.Apply(_rawPreview, preset, _activeLut);
-        }
-        catch (Exception ex)
-        {
-            SetStatus($"Không áp dụng được bộ lọc: {ex.Message}");
-        }
-    }
-
-    private FilterPreset GetSelectedPreset()
-    {
-        if (FilterComboBox.SelectedItem is ComboBoxItem item &&
-            Enum.TryParse<FilterPreset>(item.Tag?.ToString(), out var preset)) return preset;
-        return FilterPreset.Original;
-    }
-
-    #region Khung Viền PNG
-    private void LoadFramePng_Click(object sender, RoutedEventArgs e)
-    {
-        var dialog = new OpenFileDialog
-        {
-            Title = "Chọn Khung viền PNG (nền trong suốt)",
-            Filter = "Ảnh PNG (*.png)|*.png|Tất cả tệp (*.*)|*.*"
-        };
-        if (dialog.ShowDialog() == true)
-        {
-            try
-            {
-                var bitmap = new BitmapImage(new Uri(dialog.FileName));
-                FramePngOverlay.Source = bitmap;
-                FrameStatusText.Text = $"Khung: {Path.GetFileName(dialog.FileName)}";
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, $"Không thể mở khung ảnh: {ex.Message}", "Lỗi ảnh", MessageBoxButton.OK, MessageBoxImage.Error);
-            }
-        }
-    }
-
-    private void ClearFrame_Click(object sender, RoutedEventArgs e)
-    {
-        FramePngOverlay.Source = null;
-        FrameStatusText.Text = "Đã gỡ bỏ khung ảnh.";
-    }
-    #endregion
-
-    #region Sticker PNG & Emoji (Kéo Thả)
-    private void AddCustomStickerPng_Click(object sender, RoutedEventArgs e)
-    {
-        var dialog = new OpenFileDialog
-        {
-            Title = "Chọn Sticker PNG",
-            Filter = "Ảnh PNG (*.png)|*.png|Tất cả tệp (*.*)|*.*",
-            Multiselect = true
-        };
-        if (dialog.ShowDialog() == true)
-        {
-            foreach (var file in dialog.FileNames)
-            {
-                var img = new Image
-                {
-                    Source = new BitmapImage(new Uri(file)),
-                    Width = 100,
-                    Height = 100,
-                    Stretch = Stretch.Uniform,
-                    Cursor = Cursors.SizeAll
-                };
-                AttachDragEvent(img);
-                Canvas.SetLeft(img, Math.Max(0, (StickerCanvas.ActualWidth / 2) - 50));
-                Canvas.SetTop(img, Math.Max(0, (StickerCanvas.ActualHeight / 2) - 50));
-                StickerCanvas.Children.Add(img);
-            }
-        }
-    }
-
-    private void AddEmojiSticker_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is Button btn && btn.Tag is string emoji)
-        {
-            var textBlock = new TextBlock
-            {
-                Text = emoji,
-                FontSize = 54,
-                Cursor = Cursors.SizeAll
+                CaptureMode.Canon => new CanonEdsdkCaptureController(),
+                CaptureMode.VideoFrame => new VideoFrameCaptureController(() => _liveView?.LatestFrame),
+                _ => new SimulatedCaptureController(() => _liveView?.LatestFrame)
             };
-            AttachDragEvent(textBlock);
-            Canvas.SetLeft(textBlock, Math.Max(0, (StickerCanvas.ActualWidth / 2) - 30));
-            Canvas.SetTop(textBlock, Math.Max(0, (StickerCanvas.ActualHeight / 2) - 30));
-            StickerCanvas.Children.Add(textBlock);
+            await _capture.ConnectAsync(_lifetime.Token);
+            _connected = true; _lastPreviewSource = null; _previewTimer.Start();
+            StatusLabel.Text = "Đã kết nối. Live view tiếp tục hoạt động khi đếm ngược.";
         }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { await DisconnectAsync(); if (!_closing) ShowError(ex); }
+        finally { _connecting = false; if (!_closing) SetState(BoothState.Ready); }
+    }
+    private async Task DisconnectAsync()
+    {
+        _previewGeneration++; _previewTimer.Stop(); _connected = false; _lastPreviewSource = null;
+        if (_capture is not null) { await _capture.DisposeAsync(); _capture = null; }
+        if (_liveView is not null) { await _liveView.DisposeAsync(); _liveView = null; }
     }
 
-    private void AttachDragEvent(UIElement element)
+    private async void Preview_Tick(object? sender, EventArgs e)
     {
-        bool isDragging = false;
-        Point clickPosition = new Point();
-
-        element.MouseLeftButtonDown += (s, ev) =>
+        // Capturing remains eligible; only review replaces the live preview.
+        if (_previewBusy || _closing || _state is BoothState.Decorating or BoothState.Exporting) return;
+        var raw = _liveView?.LatestFrame;
+        if (raw is null)
         {
-            isDragging = true;
-            clickPosition = ev.GetPosition(StickerCanvas);
-            element.CaptureMouse();
-            ev.Handled = true;
-        };
-
-        element.MouseMove += (s, ev) =>
-        {
-            if (isDragging)
-            {
-                Point currentPos = ev.GetPosition(StickerCanvas);
-                double left = Canvas.GetLeft(element) + (currentPos.X - clickPosition.X);
-                double top = Canvas.GetTop(element) + (currentPos.Y - clickPosition.Y);
-                Canvas.SetLeft(element, left);
-                Canvas.SetTop(element, top);
-                clickPosition = currentPos;
-            }
-        };
-
-        element.MouseLeftButtonUp += (s, ev) =>
-        {
-            isDragging = false;
-            element.ReleaseMouseCapture();
-        };
-
-        // Nhấp đúp chuột vào sticker để xóa
-        element.MouseRightButtonDown += (s, ev) =>
-        {
-            StickerCanvas.Children.Remove(element);
-            ev.Handled = true;
-        };
-    }
-
-    private void ClearStickers_Click(object sender, RoutedEventArgs e)
-    {
-        StickerCanvas.Children.Clear();
-    }
-    #endregion
-
-    private void LoadLut_Click(object sender, RoutedEventArgs e)
-    {
-        var dialog = new OpenFileDialog
-        {
-            Title = "Chọn 3D LUT",
-            Filter = "3D LUT (*.cube)|*.cube|Tất cả tệp (*.*)|*.*"
-        };
-        if (dialog.ShowDialog() != true) return;
-        try
-        {
-            _activeLut = CubeLut.Load(dialog.FileName);
-            LutStatus.Text = $"Đã nạp: {Path.GetFileName(dialog.FileName)}";
-            var lutItem = FilterComboBox.Items.OfType<ComboBoxItem>().FirstOrDefault(x => x.Tag?.ToString() == "CustomLut");
-            if (lutItem is not null) FilterComboBox.SelectedItem = lutItem;
-            RefreshPreview();
-            SetStatus("Đã nạp LUT thành công.");
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, ex.Message, "Không đọc được LUT", MessageBoxButton.OK, MessageBoxImage.Error);
-        }
-    }
-
-    private async void StartSession_Click(object sender, RoutedEventArgs e)
-    {
-        if (_isBusy) return;
-        if (!_camera.IsConnected)
-        {
-            MessageBox.Show(this, "Hãy bấm bật webcam trước.", "Chưa kết nối", MessageBoxButton.OK, MessageBoxImage.Information);
+            if (_connected) { StatusLabel.Text = "Mất tín hiệu video. Hãy kết nối lại."; CaptureButton.IsEnabled = false; }
             return;
         }
-
-        _isBusy = true;
-        StartSessionButton.IsEnabled = false;
-        _capturedShots.Clear();
-        SessionProgressText.Text = "Chuẩn bị chụp...";
-        var sessionDirectory = Path.Combine(_outputDirectory, DateTime.Now.ToString("yyyyMMdd_HHmmss"));
-        Directory.CreateDirectory(sessionDirectory);
-        var preset = GetSelectedPreset();
-
+        if (ReferenceEquals(raw, _lastPreviewSource)) return;
+        _previewBusy = true; _lastPreviewSource = raw;
+        var generation = _previewGeneration;
+        var filter = _state == BoothState.Capturing && _session is not null ? _session.Filter : _settings.Filter;
+        var lut = _state == BoothState.Capturing && _session is not null ? _session.Lut : _lut;
         try
         {
-            for (var shotIndex = 1; shotIndex <= 4; shotIndex++)
+            // A single long-lived worker and one in-flight job: newer frames replace old ones, no backlog.
+            var image = await _previewWorker.InvokeAsync(() => ImageProcessor.Apply(BitmapTools.NormalizeLandscape(raw, 900, 600), filter, lut), _lifetime.Token);
+            if (!_closing && generation == _previewGeneration && _state is BoothState.Ready or BoothState.Capturing)
+                PreviewImage.Source = image;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (!_closing) StatusLabel.Text = "Live view: " + ex.Message; }
+        finally { _previewBusy = false; }
+    }
+
+    private void Options_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_initialized || _state != BoothState.Ready) return;
+        _settings.Layout = (PhotoLayout)Math.Max(0, LayoutCombo.SelectedIndex);
+        _settings.Filter = FilterCombo.SelectedItem is FilterPreset value ? value : FilterPreset.Original;
+        _lastPreviewSource = null; _previewGeneration++;
+        try { SettingsStore.Save(_settings); } catch (Exception ex) { ShowError(ex); }
+    }
+    private void LoadLut_Click(object sender, RoutedEventArgs e)
+    {
+        if (_state != BoothState.Ready) return;
+        var picker = new OpenFileDialog { Filter = "3D LUT|*.cube" };
+        if (picker.ShowDialog(this) != true) return;
+        try
+        {
+            _lut = CubeLut.Load(picker.FileName); _settings.LutPath = picker.FileName;
+            _lastPreviewSource = null; _previewGeneration++;
+            FilterCombo.SelectedItem = FilterPreset.CustomLut; LutLabel.Text = Path.GetFileName(picker.FileName); SettingsStore.Save(_settings);
+        }
+        catch (Exception ex) { ShowError(ex); }
+    }
+    private async void Settings_Click(object sender, RoutedEventArgs e)
+    {
+        if (_connecting || _state != BoothState.Ready || _closing) return;
+        var dialog = new SettingsWindow(_settings) { Owner = this };
+        if (dialog.ShowDialog() != true) return;
+        _settings = dialog.Settings; UpdateModeLabel();
+        try { LoadLiveFrame(); _operation = DisconnectAsync(); await _operation; SetState(BoothState.Ready); StatusLabel.Text = "Đã lưu. Bấm Kết nối để áp dụng nguồn camera mới."; }
+        catch (Exception ex) { ShowError(ex); }
+    }
+    private void LoadLiveFrame() => LiveFrameImage.Source = BitmapTools.LoadFrame(_settings.SingleFramePath, 1.5, "Frame ảnh đơn");
+    private void ToggleSidebar_Click(object sender, RoutedEventArgs e)
+    {
+        var show = Sidebar.Visibility != Visibility.Visible;
+        Sidebar.Visibility = show ? Visibility.Visible : Visibility.Collapsed; SidebarColumn.Width = new GridLength(show ? 330 : 0);
+    }
+
+    private async void Capture_Click(object sender, RoutedEventArgs e)
+    {
+        if (_state != BoothState.Ready || !_connected || _connecting || _closing) return;
+        _operation = CaptureSessionAsync(); await _operation;
+    }
+    private async Task CaptureSessionAsync()
+    {
+        _captureCancellation?.Dispose();
+        _captureCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        var token = _captureCancellation.Token;
+        try
+        {
+            if (_settings.Filter == FilterPreset.CustomLut && _lut is null) throw new InvalidOperationException("Nạp LUT .cube trước khi chụp với CustomLut.");
+            if (_liveView?.LatestFrame is null) throw new InvalidOperationException("Không có live view. Hãy kết nối lại.");
+            _session = new SessionSnapshot(_settings.Layout, _settings.Filter, _lut,
+                BitmapTools.LoadFrame(_settings.SingleFramePath, 1.5, "Frame ảnh đơn"),
+                BitmapTools.LoadFrame(_settings.GridFramePath, 1.5, "Frame lưới"),
+                BitmapTools.LoadFrame(_settings.StripFramePath, 0.375, "Frame dải dọc"),
+                _settings.OutputDirectory, _settings.JpegQuality);
+            var working = Path.Combine(SettingsStore.DataDirectory, "Working", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(working); SetState(BoothState.Capturing);
+            var sources = new List<string>();
+            for (var shot = 1; shot <= CompositeRenderer.PhotoCount; shot++)
             {
                 CountdownOverlay.Visibility = Visibility.Visible;
-                for (var seconds = 3; seconds >= 1; seconds--)
+                Task? focus = null;
+                for (var second = 3; second >= 1; second--)
                 {
-                    CountdownText.Text = seconds.ToString();
-                    SessionProgressText.Text = $"Ảnh {shotIndex}/4 · Chụp sau {seconds} giây";
-                    await Task.Delay(1000);
+                    if (_liveView?.LatestFrame is null) throw new IOException("Mất live view trong lúc đếm ngược. Kết nối lại nguồn video trước khi chụp tiếp.");
+                    token.ThrowIfCancellationRequested(); CountdownText.Text = second.ToString();
+                    ProgressLabel.Text = $"Ảnh {shot}/4 • Chụp sau {second} giây";
+                    if (second == 1) focus = _capture!.AutoFocusAsync(token);
+                    await Task.Delay(1000, token);
                 }
-                CountdownOverlay.Visibility = Visibility.Collapsed;
-                SessionProgressText.Text = $"Đang xử lý ảnh {shotIndex}/4…";
-
-                var captured = await _camera.CaptureAsync();
-                var processed = ImageProcessor.Apply(captured, preset, _activeLut);
-                _capturedShots.Add(processed);
-                ImageExporter.SaveJpeg(processed, Path.Combine(sessionDirectory, $"photo_{shotIndex:02}.jpg"), 95);
-                SetStatus($"Đã lưu ảnh {shotIndex}/4.");
+                await focus!; token.ThrowIfCancellationRequested(); CountdownText.Text = "0";
+                var path = Path.Combine(working, $"source_{shot:00}.jpg");
+                await _capture!.CaptureToFileAsync(path, token); sources.Add(path);
+                CountdownOverlay.Visibility = Visibility.Collapsed; ProgressLabel.Text = $"Đã nhận {shot}/4 ảnh";
             }
-
-            SessionProgressText.Text = "Đang ghép dải ảnh…";
-            var strip = ImageExporter.ComposeStrip(_capturedShots, "Classic");
-            var stripPath = Path.Combine(sessionDirectory, "photostrip.jpg");
-            ImageExporter.SaveJpeg(strip, stripPath, 95);
-
-            _liveViewTimer.Stop();
-            PreviewImage.Source = strip;
-
-            SessionProgressText.Text = "Hoàn tất · 4 ảnh riêng + 1 dải ảnh";
-            SetStatus($"Đã xuất ảnh tại: {sessionDirectory}");
-
-            MessageBox.Show(this,
-                $"Hoàn tất phiên chụp.\n\nĐã lưu 4 ảnh riêng và 1 dải ảnh tại:\n{sessionDirectory}",
-                "Xuất ảnh thành công", MessageBoxButton.OK, MessageBoxImage.Information);
-
-            _liveViewTimer.Start();
+            _previewTimer.Stop(); _previewGeneration++; CountdownOverlay.Visibility = Visibility.Collapsed;
+            ProgressLabel.Text = "Đang chuẩn bị popup Xem lại & Trang trí...";
+            token.ThrowIfCancellationRequested(); SetState(BoothState.Decorating);
+            _review = new ReviewWindow(sources, _session, () => _settings, settings => { _settings = settings; }, _lifetime.Token) { Owner = this };
+            _review.ShowDialog(); _review = null;
+            StatusLabel.Text = "Phiên đã đóng. Ảnh nguồn được giữ trong Working; sẵn sàng cho lượt tiếp theo.";
         }
-        catch (Exception ex)
-        {
-            SetStatus($"Phiên chụp lỗi: {ex.Message}");
-            MessageBox.Show(this, ex.Message, "Lỗi phiên chụp", MessageBoxButton.OK, MessageBoxImage.Error);
-        }
+        catch (OperationCanceledException) { if (!_closing) { await DisconnectAsync(); StatusLabel.Text = "Đã hủy chụp. Kết nối lại trước phiên mới."; } }
+        catch (Exception ex) { if (!_closing) { await DisconnectAsync(); ShowError(ex); } }
         finally
         {
-            CountdownOverlay.Visibility = Visibility.Collapsed;
-            StartSessionButton.IsEnabled = true;
-            _isBusy = false;
+            _session = null; CountdownOverlay.Visibility = Visibility.Collapsed;
+            if (!_closing)
+            {
+                CancelButton.IsEnabled = true; _lastPreviewSource = null; SetState(BoothState.Ready);
+                if (_connected) _previewTimer.Start();
+            }
         }
     }
 
-    private void ChooseOutputFolder_Click(object sender, RoutedEventArgs e)
+    private void SetState(BoothState state)
     {
-        var dialog = new OpenFolderDialog { Title = "Chọn thư mục xuất ảnh", Multiselect = false };
-        if (dialog.ShowDialog() == true)
-        {
-            _outputDirectory = dialog.FolderName;
-            OutputFolderText.Text = _outputDirectory;
-            SetStatus($"Thư mục xuất đã đổi: {_outputDirectory}");
-        }
+        _state = state; PreparationPanel.IsEnabled = state == BoothState.Ready && !_connecting;
+        SettingsButton.IsEnabled = ConnectButton.IsEnabled = state == BoothState.Ready && !_connecting;
+        CaptureButton.IsEnabled = state == BoothState.Ready && _connected && !_connecting;
+        CancelButton.Visibility = state == BoothState.Capturing ? Visibility.Visible : Visibility.Collapsed;
+        StepLabel.Text = state switch { BoothState.Ready => "01 • CHUẨN BỊ", BoothState.Capturing => "02 • CHỤP 4 ẢNH", _ => "03 • XEM LẠI & TRANG TRÍ" };
+        if (state == BoothState.Ready) ProgressLabel.Text = "Chọn bố cục mặc định và màu, rồi chụp 4 ảnh.";
     }
-
-    private void OpenOutputFolder_Click(object sender, RoutedEventArgs e)
+    private void Cancel_Click(object sender, RoutedEventArgs e) { CancelButton.IsEnabled = false; _captureCancellation?.Cancel(); }
+    private void ShowError(Exception ex)
     {
-        Directory.CreateDirectory(_outputDirectory);
-        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-        {
-            FileName = _outputDirectory,
-            UseShellExecute = true
-        });
+        StatusLabel.Text = ex.Message; MessageBox.Show(this, ex.Message, "Photobooth VHU", MessageBoxButton.OK, MessageBoxImage.Information);
     }
-
-    private void SetStatus(string message) => FooterStatus.Text = message;
-
-    protected override async void OnClosed(EventArgs e)
+    private async void Window_Closing(object? sender, CancelEventArgs e)
     {
-        _liveViewTimer.Stop();
-        await _camera.DisposeAsync();
-        base.OnClosed(e);
+        if (_closeAllowed) return;
+        e.Cancel = true; if (_closing) return;
+        _closing = true; _previewTimer.Stop(); _lifetime.Cancel(); _captureCancellation?.Cancel(); _review?.Close();
+        try { await _operation; await DisconnectAsync(); await _previewWorker.DisposeAsync(); }
+        catch { /* Finish closing even if a device has already disconnected. */ }
+        finally { _closeAllowed = true; Close(); }
     }
 }
